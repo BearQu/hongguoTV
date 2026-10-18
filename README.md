@@ -1,5 +1,14 @@
 # hongguoTV
 
+> **关于这个 fork**：本仓库在上游 [N3urda/hongguoTV](https://github.com/N3urda/hongguoTV) 基础上修复了「短剧无法播放 / 一直在重试」问题（上游 issue #16 / #19 / #17 / #20），修复以 PR 形式提交上游：[N3urda/hongguoTV#23](https://github.com/N3urda/hongguoTV/pull/23)。
+>
+> - **根因**：原版使用写死的全网共享设备号，已被红果播放接口拒绝（错误码 110001）。
+> - **修复**：每台电视注册自己的独立设备（被拒自动重注册）、真实 x-argus / x-ladon 签名、双模型清晰度选择。算法移植自 [fqapp](https://github.com/ch6vip/fqapp)（同为 GPL-3.0，来源署名见 `kotlin-tv/NOTICE.md`）。
+> - **下载**：见本仓库 [Releases](https://github.com/BearQu/hongguoTV/releases)，Android 8.0+ 电视可直接安装。
+> - **安装**：如果之前装过官方版，因签名不同需先卸载再装；命令行 `adb install -r 文件名.apk` 亦可。
+> - **更新**：本 fork 构建版本号带 `-local` 后缀，不会被官方版的应用内自动更新覆盖回无法播放的旧版。
+> - 以下为上游原版 README，内容未改动。
+
 当前分支提供 **Kotlin 原生独立 APK**：安装后联网即可使用，无需 Node / Docker。最低 Android 8.0，电视遥控器操作。
 
 **[下载原生版 APK](https://github.com/N3urda/hongguoTV-updates/releases/latest)** · [原生版说明与构建](kotlin-tv/README.md)
