@@ -26,6 +26,7 @@ class SearchSessionExpiredException: IOException("搜索结果已过期，请从
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
     private val signer = Signer()
+    private val devices = PlayerDeviceSource(http)
     private val site = "https://hongguoduanju.com"
     private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
@@ -125,6 +126,73 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
+        // The player endpoints reject the legacy embedded device id (error 110001),
+        // so resolve via freshly registered devices like fqapp does, re-registering
+        // once when upstream rejects the signature. The old fixed-device call
+        // stays as a last-resort fallback.
+        for (attempt in 0..1) {
+            try { return playerStream(id, maxQuality) }
+            catch (e: DeviceRejectedException) { devices.invalidate() }
+            catch (e: Exception) { break }
+        }
+        return legacyStream(id, maxQuality)
+    }
+    private fun playerStream(id: String, maxQuality: Int): StreamInfo {
+        val device = devices.obtain()
+        val rows = mutableListOf<PlayerVariant>()
+        var rejected = false
+        var sawResponse = false
+        var transportFailure: Exception? = null
+        val requests = listOf(
+            Triple(PlayerDeviceSource.substituteDevice(PlayerDeviceSource.SHORTPLAY_URL, device), PlayerDeviceSource.shortplayBody(id), mapOf("User-Agent" to "com.dragon.read", "Content-Type" to "application/json; charset=utf-8")),
+            Triple(PlayerDeviceSource.substituteDevice(PlayerDeviceSource.PHOENIX_URL, device), PlayerDeviceSource.phoenixBody(id), mapOf("User-Agent" to VendorConstants.VIDEO_UA, "Accept" to "application/json; charset=utf-8,application/x-protobuf", "Content-Type" to "application/json", "x-xs-from-web" to "0", "sdk-version" to "2")),
+        )
+        for ((url, body, headers) in requests) {
+            try {
+                val signed = PlayerSigner.headers(url.substringAfter('?', ""), body)
+                val data = JSONObject(fetch(url, headers + signed, body))
+                val code = data.optInt("code", data.optInt("Code", 0))
+                if (code == 10001 || code == 10002 || code == 110001) throw DeviceRejectedException("播放接口拒绝该设备")
+                sawResponse = true
+                for (model in StreamModels.models(data.optJSONObject("data") ?: JSONObject())) {
+                    rows += StreamModels.listRows(model.optJSONObject("video_list"), StreamModels.keySeed(model))
+                    rows += StreamModels.arrayRows(model.optJSONArray("video_list"))
+                    val fallbackUrl = StreamModels.fallbackApiUrl(model)
+                    if (fallbackUrl.startsWith("https://")) runCatching {
+                        val fallback = JSONObject(fetch(fallbackUrl, mapOf("User-Agent" to PlayerDeviceSource.FALLBACK_USER_AGENT, "Accept-Language" to "zh-CN,zh;q=0.9"), null))
+                        val info = fallback.optJSONObject("video_info")?.optJSONObject("data")
+                        rows += StreamModels.listRows(info?.optJSONObject("video_list"), info?.str("key_seed")?.takeIf { it.isNotEmpty() }?.let(StreamModels::lenientB64))
+                    }
+                }
+            } catch (e: DeviceRejectedException) { rejected = true }
+            catch (e: Exception) { transportFailure = e }
+        }
+        val chosen = StreamModels.pick(rows, maxQuality)
+            ?: run {
+                if (rejected) throw DeviceRejectedException("播放设备已被上游拒绝")
+                if (!sawResponse) throw transportFailure ?: IOException("播放接口暂不可用")
+                throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+            }
+        val quality = if (chosen.quality > 0) "${chosen.quality}P" + (if (chosen.quality > maxQuality) "（兼容资源）" else "") else "自动"
+        return StreamInfo(chosen.url, chosen.key, quality)
+    }
+    private fun fetch(url: String, headers: Map<String, String>, body: ByteArray?): String {
+        val request = Request.Builder().url(url).header("Accept-Language", "zh-CN,zh;q=0.9")
+        headers.forEach { (k, v) -> request.header(k, v) }
+        body?.let { request.post(it.toRequestBody("application/json; charset=UTF-8".toMediaType())) }
+        return RequestScope.execute(http.newCall(request.build())) { response ->
+            if (response.code == 401 || response.code == 403) throw DeviceRejectedException("播放请求被拒绝（HTTP ${response.code}）")
+            if (!response.isSuccessful) throw IOException("内容请求失败（HTTP ${response.code}）")
+            val bodyStream = response.body ?: throw IOException("内容响应为空")
+            if (bodyStream.contentLength() > 16 * 1024 * 1024) throw IOException("内容响应过大")
+            val input = bodyStream.byteStream(); val out = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
+            while (out.size() <= 16 * 1024 * 1024) { val n = input.read(buffer); if (n < 0) break; out.write(buffer, 0, n) }
+            if (out.size() > 16 * 1024 * 1024) throw IOException("内容响应过大")
+            String(out.toByteArray(), Charsets.UTF_8)
+        }
+    }
+    private fun legacyStream(id: String, maxQuality: Int = 1080): StreamInfo {
+        require(id.matches(Regex("[0-9]{1,30}")))
         val payload="""{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
         val signed=signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/",VendorConstants.device,payload)
         val data=JSONObject(text(signed.url,signed))
@@ -151,6 +219,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return StreamInfo(url,key,quality)
     }
     companion object {
+        /** Where the app persists the registered player device (preferences store). */
+        @Volatile var deviceStore: PlayerDeviceStore? = null
         fun extractRouter(html: String): JSONObject {
             val marker=html.indexOf("_ROUTER_DATA"); if(marker<0) throw IOException("页面没有内容数据")
             val first=html.indexOf('{',marker); if(first<0) throw IOException("页面数据格式错误")
