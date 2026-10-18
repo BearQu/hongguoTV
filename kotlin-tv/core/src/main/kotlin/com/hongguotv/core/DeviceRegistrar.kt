@@ -91,8 +91,12 @@ internal class DeviceRegistrar(
         val di = newDevInfo()
         val (deviceId, installId) = deviceRegister(http, di)
         runCatching { appAlertCheck(http, di, deviceId, installId) }
-        sleep(2000)
-        runCatching { activatePremium(http, di, deviceId, installId) }
+        // The privilege activation is a promotional loophole, not part of stream
+        // resolution; skip it when the device is only used for playback.
+        if (System.getenv("HONGGUOTV_SKIP_PREMIUM") == null) {
+            sleep(2000)
+            runCatching { activatePremium(http, di, deviceId, installId) }
+        }
         val secretKey = runCatching { registerKey(http, di, deviceId, installId) }.getOrDefault("")
         return PlayerDevice(deviceId, installId, di.cdid, di.openudid, secretKey)
     }
