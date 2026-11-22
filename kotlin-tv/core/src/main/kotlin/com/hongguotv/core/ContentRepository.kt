@@ -26,6 +26,7 @@ class SearchSessionExpiredException: IOException("搜索结果已过期，请从
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
     private val signer = Signer()
+    private val devices = PlayerDeviceSource(http)
     private val site = "https://hongguoduanju.com"
     private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
@@ -125,9 +126,163 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
+        // The player endpoints reject the legacy embedded device id (error 110001),
+        // so resolve via freshly registered devices like fqapp does, re-registering
+        // once when upstream rejects the signature. The old fixed-device call
+        // stays as a last-resort fallback.
+        for (attempt in 0..2) {
+            try { return playerStream(id, maxQuality) }
+            catch (e: DeviceRejectedException) { devices.invalidate() }
+            catch (e: Exception) { break }
+        }
+        return legacyStream(id, maxQuality)
+    }
+    private fun playerStream(id: String, maxQuality: Int): StreamInfo {
+        val device = devices.obtain()
+        val rows = mutableListOf<PlayerVariant>()
+        var rejected = false
+        var sawResponse = false
+        var sawEmpty = false
+        var transportFailure: Exception? = null
+        val cookieHeader = if (device.cookies.isBlank()) emptyMap() else mapOf("Cookie" to device.cookies)
+        val phoenixHeaders = mapOf("User-Agent" to VendorConstants.VIDEO_UA, "Accept" to "application/json; charset=utf-8,application/x-protobuf", "Content-Type" to "application/json", "x-xs-from-web" to "0", "sdk-version" to "2") + cookieHeader
+        // The official red-novel app calls /multi_video_model/:dr_scene/v1/ with
+        // dr_scene=default; that variant returns a full model where the old paths
+        // answer HTTP 200 with an empty body. Try it first.
+        val requests = listOf(
+            Triple(PlayerDeviceSource.substituteDevice(PlayerDeviceSource.PHOENIX_DEFAULT_URL, device), PlayerDeviceSource.phoenixBody(id), phoenixHeaders),
+            Triple(PlayerDeviceSource.substituteDevice(PlayerDeviceSource.PHOENIX_URL, device), PlayerDeviceSource.phoenixBody(id), phoenixHeaders),
+            Triple(PlayerDeviceSource.substituteDevice(PlayerDeviceSource.PHOENIX_SINGLE_URL, device), PlayerDeviceSource.shortplayBody(id), phoenixHeaders),
+            Triple(PlayerDeviceSource.substituteDevice(PlayerDeviceSource.SHORTPLAY_URL, device), PlayerDeviceSource.shortplayBody(id), mapOf("User-Agent" to "com.dragon.read", "Content-Type" to "application/json; charset=utf-8") + cookieHeader),
+        )
+        for ((url, body, headers) in requests) {
+            // Upstream intermittently short-circuits signing with a blank 200;
+            // one immediate retry on the same endpoint usually recovers.
+            for (attempt in 0..1) {
+                try {
+                    val signed = PlayerSigner.headers(url.substringAfter('?', ""), body)
+                    val text = fetch(url, headers + signed, body)
+                    if (text.isBlank()) { sawEmpty = true; continue }
+                    sawResponse = true
+                    val data = JSONObject(text)
+                    val code = data.optInt("code", data.optInt("Code", 0))
+                    if (code == 10001 || code == 10002 || code == 110001) throw DeviceRejectedException("播放接口拒绝该设备")
+                    for (model in StreamModels.models(data.optJSONObject("data") ?: JSONObject())) {
+                        rows += StreamModels.listRows(model.optJSONObject("video_list"), StreamModels.keySeed(model))
+                        rows += StreamModels.arrayRows(model.optJSONArray("video_list"))
+                        val fallbackUrl = StreamModels.fallbackApiUrl(model)
+                        if (fallbackUrl.startsWith("https://")) runCatching {
+                            val fallback = JSONObject(fetch(fallbackUrl, mapOf("User-Agent" to PlayerDeviceSource.FALLBACK_USER_AGENT, "Accept-Language" to "zh-CN,zh;q=0.9"), null))
+                            val info = fallback.optJSONObject("video_info")?.optJSONObject("data")
+                            rows += StreamModels.listRows(info?.optJSONObject("video_list"), info?.str("key_seed")?.takeIf { it.isNotEmpty() }?.let(StreamModels::lenientB64))
+                        }
+                    }
+                    break
+                } catch (e: DeviceRejectedException) { rejected = true; break }
+                catch (e: Exception) { transportFailure = e }
+            }
+        }
+        // Official App also exposes the model via GET /reading/bookapi/video_tab/...;
+        // use it as one more fallback when the POST variants are short-circuited.
+        if (!rejected) runCatching { rows += tabVideoRows(id, device) }
+        val chosen = StreamModels.pick(rows, maxQuality)
+            ?: run {
+                if (rejected) throw DeviceRejectedException("播放设备已被上游拒绝")
+                if (!sawResponse) throw transportFailure ?: IOException("播放接口暂不可用")
+                throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+            }
+        val quality = if (chosen.quality > 0) "${chosen.quality}P" + (if (chosen.quality > maxQuality) "（兼容资源）" else "") else "自动"
+        return StreamInfo(chosen.url, chosen.key, quality)
+    }
+    private fun tabVideoRows(id: String, device: PlayerDevice): List<PlayerVariant> {
+        val values = VendorConstants.device.toMutableMap()
+        values["device_id"] = device.deviceId
+        values["iid"] = device.installId
+        values.putAll(mapOf(
+            "video_id" to id, "video_id_type" to "0", "device_level" to "1",
+            "need_all_video_definition" to "1", "need_mp4_align" to "0",
+            "use_os_player" to "0", "video_platform" to "1024", "source" to "0",
+            "from_video_id" to "",
+        ))
+        val cookieHeader = if (device.cookies.isBlank()) emptyMap() else mapOf("Cookie" to device.cookies)
+        val signed = signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/", values)
+        val text = fetch(signed.url, signed.headers + cookieHeader, signed.body)
+        if (text.isBlank()) return emptyList()
+        val root = JSONObject(text)
+        if (root.optInt("code", root.optInt("Code", -1)) != 0) return emptyList()
+        val data = root.optJSONObject("data") ?: return emptyList()
+        val container = data.optJSONObject("video_model_data") ?: data
+        val row = container.optJSONObject(id)
+            ?: container.keys().asSequence().mapNotNull { container.optJSONObject(it) }.firstOrNull()
+            ?: return emptyList()
+        val model = row.optJSONObject("video_model") ?: JSONObject(row.str("video_model"))
+        val seed = StreamModels.keySeed(model)
+        val rows = StreamModels.listRows(model.optJSONObject("video_list"), seed) +
+            StreamModels.arrayRows(model.optJSONArray("video_list"))
+        // Upstream 0.16.13: when the tab model is empty or exposes byteVC2 only,
+        // the same identity on the player endpoint (level 1) can supply HEVC.
+        // Keep byteVC2 as a selectable fallback via local transcode below.
+        if (rows.isNotEmpty() && rows.none { it.byteVc2 }) return rows
+        val playerRows = runCatching { playerModelRows(id, device) }.getOrNull().orEmpty()
+        val compatible = playerRows.filter { !it.byteVc2 }
+        return rows + (compatible.ifEmpty { playerRows })
+    }
+
+    /** level-1 player endpoint from upstream 0.16.13, for the byteVC2-only fallback.
+     *  Mirrors MobilePlayback.ladder: level-1 biz_param in a gzip body, dr_scene=player. */
+    private fun playerModelRows(id: String, device: PlayerDevice): List<PlayerVariant> {
+        val values = VendorConstants.device.toMutableMap()
+        values["device_id"] = device.deviceId
+        values["iid"] = device.installId
+        values["_rticket"] = clock().toString()
+        val payload = JSONObject()
+            .put("dr_scene", "player")
+            .put("biz_param", JSONObject()
+                .put("detail_page_version", 0).put("device_level", 1)
+                .put("disable_digg_stat", false).put("disable_video_relate_book", false)
+                .put("need_all_video_definition", true).put("need_mp4_align", false)
+                .put("use_os_player", false).put("use_server_dns", false)
+                .put("video_platform", 1024))
+            .put("mixed_video_id_map", JSONObject().put("1004", JSONArray().put(id)))
+        val output = java.io.ByteArrayOutputStream()
+        java.util.zip.GZIPOutputStream(output).use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+        val body = output.toByteArray()
+        val signed = signer.sign("https://api5-normal-sinfonlinea.fqnovel.com/novel/player/multi_video_model/player/v1/", values, body)
+        val headers = signed.headers + mapOf("Content-Encoding" to "gzip") +
+            if (device.cookies.isBlank()) emptyMap() else mapOf("Cookie" to device.cookies)
+        val text = fetch(signed.url, headers, signed.body)
+        if (text.isBlank()) return emptyList()
+        val root = JSONObject(text)
+        if (root.optInt("code", root.optInt("Code", -1)) != 0) return emptyList()
+        val data = root.optJSONObject("data") ?: return emptyList()
+        return StreamModels.models(data).flatMap { model ->
+            val seed = StreamModels.keySeed(model)
+            StreamModels.listRows(model.optJSONObject("video_list"), seed) +
+                StreamModels.arrayRows(model.optJSONArray("video_list"))
+        }
+    }
+
+    private fun fetch(url: String, headers: Map<String, String>, body: ByteArray?): String {
+        val request = Request.Builder().url(url).header("Accept-Language", "zh-CN,zh;q=0.9")
+        headers.forEach { (k, v) -> request.header(k, v) }
+        body?.let { request.post(it.toRequestBody("application/json; charset=UTF-8".toMediaType())) }
+        return RequestScope.execute(http.newCall(request.build())) { response ->
+            if (response.code == 401 || response.code == 403) throw DeviceRejectedException("播放请求被拒绝（HTTP ${response.code}）")
+            if (!response.isSuccessful) throw IOException("内容请求失败（HTTP ${response.code}）")
+            val bodyStream = response.body ?: throw IOException("内容响应为空")
+            if (bodyStream.contentLength() > 16 * 1024 * 1024) throw IOException("内容响应过大")
+            val input = bodyStream.byteStream(); val out = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
+            while (out.size() <= 16 * 1024 * 1024) { val n = input.read(buffer); if (n < 0) break; out.write(buffer, 0, n) }
+            if (out.size() > 16 * 1024 * 1024) throw IOException("内容响应过大")
+            String(out.toByteArray(), Charsets.UTF_8)
+        }
+    }
+    private fun legacyStream(id: String, maxQuality: Int = 1080): StreamInfo {
+        require(id.matches(Regex("[0-9]{1,30}")))
         val payload="""{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
         val signed=signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/",VendorConstants.device,payload)
-        val data=JSONObject(text(signed.url,signed))
+        val rawResponse=runCatching { text(signed.url,signed) }.getOrNull()?.takeIf { it.isNotBlank() } ?: throw IOException("播放接口暂不可用")
+        val data=runCatching { JSONObject(rawResponse) }.getOrNull() ?: throw IOException("播放响应格式异常")
         if(data.optInt("Code",data.optInt("code",0))!=0) throw IOException("播放接口暂不可用")
         val map=data.optJSONObject("data") ?: throw IOException("播放信息为空")
         val entry=map.optJSONObject(id) ?: map.keys().asSequence().mapNotNull { map.optJSONObject(it) }.firstOrNull() ?: throw IOException("播放信息为空")
@@ -137,11 +292,17 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         if(!fallback.startsWith("https://")) throw IOException("播放地址格式异常")
         val info=JSONObject(text(fallback)).optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
         val videoList=info.optJSONObject("video_list") ?: throw IOException("没有可用清晰度")
-        // ByteVC2 resources can expose playable audio but no video track in Android's MP4 extractor.
-        // Keep missing legacy codec labels usable, but never select a known incompatible variant.
-        val rows=videoList.keys().asSequence().mapNotNull { k -> videoList.optJSONObject(k)?.let { k to it } }.filter {
-            it.second.str("main_url").isNotEmpty() && it.second.str("codec_type").lowercase() !in setOf("bytevc2","bvc2")
-        }.map { (k,o) -> Triple(qualityNumber(o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } }),k,o) }.sortedByDescending { it.first }.toList()
+        // byteVC2 is now a low-priority but selectable variant; the app transcodes
+        // it locally via TranscodingVideoDataSource. Keep it in the list, ranked
+        // below hard-decodable renditions, but drop rows with no playable URL.
+        val rows=videoList.keys().asSequence().mapNotNull { k -> videoList.optJSONObject(k)?.let { k to it } }
+            .filter { it.second.str("main_url").isNotEmpty() }
+            .map { (k,o) ->
+                val q=qualityNumber(o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } })
+                val codec=o.str("codec_type").lowercase()
+                val score=if (codec.contains("bytevc2") || codec.contains("bvc2")) q-100000 else q
+                Triple(score,k,o)
+            }.sortedByDescending { it.first }.toList()
         val selected=rows.firstOrNull { it.first<=maxQuality } ?: rows.lastOrNull() ?: throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
         val item=selected.third; var url=cleanUrl(item.str("main_url")); val seed=info.str("key_seed")
         if(seed.isNotEmpty()) url=MediaCrypto.decryptUrl(url,decode64(seed))
@@ -151,6 +312,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return StreamInfo(url,key,quality)
     }
     companion object {
+        /** Where the app persists the registered player device (preferences store). */
+        @Volatile var deviceStore: PlayerDeviceStore? = null
         fun extractRouter(html: String): JSONObject {
             val marker=html.indexOf("_ROUTER_DATA"); if(marker<0) throw IOException("页面没有内容数据")
             val first=html.indexOf('{',marker); if(first<0) throw IOException("页面数据格式错误")

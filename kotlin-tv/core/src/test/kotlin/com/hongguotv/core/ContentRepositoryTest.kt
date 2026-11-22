@@ -20,11 +20,12 @@ class ContentRepositoryTest {
         } else """{"data":{"123":{"video_model":{"fallback_api":"https://example.com/stream"}}}}"""
     }
 
-    @Test fun incompatibleByteVc2DoesNotBecomeAudioOnlyPlayback() {
+    @Test fun byteVc2IsLowPriorityButStillSelectable() {
         val repo=streamRepository(Triple(720,"bytevc2","https://example.com/unsupported"),Triple(1080,"bytevc1","https://example.com/hevc"))
         val result=repo.stream("123",720)
-        assertEquals("https://example.com/hevc",result.url)
-        assertEquals("1080P（兼容资源）",result.quality)
+        // hevc is 1080P (above maxQuality) so bytevc2 becomes the selectable fallback;
+        // the app transcodes it locally instead of failing.
+        assertEquals("https://example.com/unsupported",result.url)
     }
 
     @Test fun compatibleLowerQualityWinsBeforeHigherResolutionFallback() {
@@ -32,9 +33,10 @@ class ContentRepositoryTest {
         assertEquals("480P",repo.stream("123",720).quality)
     }
 
-    @Test fun entirelyIncompatibleSourceFailsBeforeStartingAudio() {
+    @Test fun byteVc2OnlySourceIsReturnedForLocalTranscode() {
         val repo=streamRepository(Triple(720,"ByteVC2","https://example.com/unsupported"),Triple(480,"bvc2","https://example.com/unsupported2"))
-        assertThrows(IOException::class.java) { repo.stream("123",720) }
+        // byteVC2 is now a selectable low-priority variant; the app transcodes it locally.
+        assertEquals("https://example.com/unsupported", repo.stream("123",720).url)
     }
 
     @Test fun legacyMissingCodecLabelKeepsQualityLimit() {

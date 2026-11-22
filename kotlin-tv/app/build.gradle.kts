@@ -7,12 +7,25 @@ fun signingValue(env: String, key: String): String? = System.getenv(env) ?: sign
 android {
     namespace = "com.hongguotv.nativeapp"
     compileSdk = 36
+    ndkVersion = "27.1.12297006"
     defaultConfig {
         applicationId = "com.hongguotv.nativeapp"
         minSdk = 26
         targetSdk = 36
         versionCode = System.getenv("HONGGUOTV_VERSION_CODE")?.toInt() ?: 9
         versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.9.0"
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                abiFilters += "arm64-v8a"
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
     buildFeatures { buildConfig = true }
     signingConfigs {
